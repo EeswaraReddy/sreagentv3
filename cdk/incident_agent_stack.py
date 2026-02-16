@@ -131,7 +131,7 @@ class IncidentAgentStack(Stack):
             self,
             "DependenciesLayer",
             code=lambda_.Code.from_asset("../lambda_layer"),
-            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_11],
             description="Strands, Boto3, and other dependencies"
         )
 
@@ -142,7 +142,7 @@ class IncidentAgentStack(Stack):
             self,
             "OrchestratorFunction",
             function_name="incident-orchestrator",
-            runtime=lambda_.Runtime.PYTHON_3_12,
+            runtime=lambda_.Runtime.PYTHON_3_11,
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("../lambdas/orchestrator"),
             role=lambda_role,
@@ -165,7 +165,7 @@ class IncidentAgentStack(Stack):
             self,
             "PollerFunction",
             function_name="incident-poller",
-            runtime=lambda_.Runtime.PYTHON_3_12,
+            runtime=lambda_.Runtime.PYTHON_3_11,
             handler="handler.lambda_handler",
             code=lambda_.Code.from_asset("../lambdas/poller"),
             role=lambda_role,

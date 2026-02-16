@@ -28,7 +28,7 @@ class LambdaStack(Stack):
 
         # Common Lambda configuration
         common_props = {
-            "runtime": _lambda.Runtime.PYTHON_3_12,
+            "runtime": _lambda.Runtime.PYTHON_3_11,
             "timeout": Duration.seconds(30),
             "memory_size": 256,
             "tracing": _lambda.Tracing.ACTIVE,

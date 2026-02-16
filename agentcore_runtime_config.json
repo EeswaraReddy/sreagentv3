@@ -3,6 +3,7 @@
         "handler": "agents.main:handler",
         "timeout_seconds": 300,
         "memory_mb": 1024,
+        "python_version": "3.11",
         "framework": "strands-agents"
     },
     "environment": {
