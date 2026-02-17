@@ -10,17 +10,16 @@ from typing import Any
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
-# Import agent components
-from .intent_classifier import classify_intent
-from .investigator import investigate
-from .action_agent import execute_action
-from .policy_engine import apply_policy, build_rca
+# Import orchestrator (hybrid agent-as-tool pattern)
+from .orchestrator import OrchestratorAgent, create_orchestrator, orchestrate_incident
 from .schemas import validate_output
 from .config import RCA_BUCKET, RCA_PREFIX, METRICS_NAMESPACE
+from .gateway_client import GatewayToolProvider
 
 # Initialize AWS clients
 s3 = boto3.client("s3")
 cloudwatch = boto3.client("cloudwatch")
+
 
 
 # BedrockAgentCoreApp decorator setup
@@ -103,16 +102,14 @@ def store_rca_to_s3(sys_id: str, rca: dict) -> str:
 
 
 @app.handler
-async def handler(event: dict, context: dict) -> dict:
+def handler(event: dict, context: dict) -> dict:
     """Main orchestrator handler for Bedrock AgentCore Runtime.
     
     This is the entrypoint for the multi-agent incident handler.
-    It orchestrates the flow through:
-    1. Intent classification
-    2. Investigation
-    3. Action execution
-    4. Policy decision
-    5. RCA storage and ServiceNow update
+    Uses the hybrid agent-as-tool orchestration pattern:
+    - LLM decides which agents to call (intelligent routing)
+    - Deterministic guardrails enforce policy and evaluation gates
+    - Mandatory evaluation before any incident update/closure
     
     Args:
         event: Contains incident payload from ServiceNow
@@ -130,120 +127,105 @@ async def handler(event: dict, context: dict) -> dict:
     logger.info(f"Processing incident {sys_id}: {incident.get('short_description', 'N/A')}")
     emit_metric("Invocations", dimensions={"Agent": "Orchestrator"})
     
-    result = {
-        "incident_id": sys_id,
-        "timestamp": start_time.isoformat(),
-        "stages": {}
-    }
+    # Connect to AgentCore Gateway for MCP tools
+    # Tools are Lambda functions invoked via Gateway (IAM role auth)
+    gateway = GatewayToolProvider()
     
     try:
-        # ============ STAGE 1: INTENT CLASSIFICATION ============
-        logger.info("Stage 1: Intent Classification")
-        emit_metric("Invocations", dimensions={"Agent": "IntentClassifier"})
+        # ============ FETCH MCP TOOLS FROM GATEWAY ============
+        # Gateway exposes Lambda functions as MCP tools:
+        #   Agent → MCPClient → AgentCore Gateway (IAM) → Lambda
+        mcp_tools = gateway.start()
+        logger.info(f"Gateway tools available: {len(mcp_tools)}")
         
-        intent_result = await classify_intent(incident)
-        result["stages"]["intent"] = intent_result
+        # ============ HYBRID ORCHESTRATION ============
+        # The OrchestratorAgent uses LLM-driven routing with agents-as-tools.
+        # Evaluation gates and policy overrides are enforced deterministically.
         
-        # Validate intent output
-        is_valid, error = validate_output(intent_result, "intent")
-        if not is_valid:
-            logger.warning(f"Intent validation failed: {error}")
-            emit_metric("Failure", dimensions={"Schema": "intent"})
-            return _human_review_response(sys_id, f"Intent validation failed: {error}", result)
+        # Create orchestrator with Gateway MCP tools
+        orchestrator = create_orchestrator(mcp_tools=mcp_tools)
+        rca = orchestrator.orchestrate(incident)
         
-        emit_metric("Classification", dimensions={"Intent": intent_result.get("intent", "unknown")})
-        emit_metric("Confidence", value=intent_result.get("confidence", 0.0), unit="None")
+        # ============ POST-ORCHESTRATION: DETERMINISTIC STEPS ============
         
-        # Check for low confidence
-        if intent_result.get("confidence", 0.0) < 0.3:
-            emit_metric("LowConfidence", dimensions={"Intent": intent_result.get("intent", "unknown")})
+        # Extract key results for metrics and response
+        intent = rca.get("classification", {}).get("intent", "unknown")
+        confidence = rca.get("classification", {}).get("confidence", 0.0)
+        decision = rca.get("decision", {}).get("outcome", "human_review")
+        score = rca.get("decision", {}).get("score", 0.0)
+        reasoning = rca.get("decision", {}).get("reasoning", "")
         
-        # ============ STAGE 2: INVESTIGATION ============
-        logger.info("Stage 2: Investigation")
-        emit_metric("Invocations", dimensions={"Agent": "Investigator"})
+        # Emit metrics
+        emit_metric("Classification", dimensions={"Intent": intent})
+        emit_metric("Confidence", value=confidence, unit="None")
+        emit_metric("Decision", dimensions={"Outcome": decision})
         
-        # Get MCP tools from context (provided by AgentCore Gateway)
-        mcp_tools = context.get("mcp_tools", [])
+        if confidence < 0.3:
+            emit_metric("LowConfidence", dimensions={"Intent": intent})
         
-        investigation = await investigate(intent_result, incident, mcp_tools)
-        result["stages"]["investigation"] = investigation
+        if rca.get("guardrails"):
+            for guardrail in rca["guardrails"]:
+                emit_metric("GuardrailEnforced", dimensions={
+                    "Type": guardrail.get("type", "unknown")
+                })
         
-        # Validate investigation output
-        is_valid, error = validate_output(investigation, "investigation")
-        if not is_valid:
-            logger.warning(f"Investigation validation failed: {error}")
-            emit_metric("Failure", dimensions={"Schema": "investigation"})
-            return _human_review_response(sys_id, f"Investigation validation failed: {error}", result)
-        
-        # ============ STAGE 3: ACTION EXECUTION ============
-        logger.info("Stage 3: Action Execution")
-        emit_metric("Invocations", dimensions={"Agent": "ActionAgent"})
-        
-        action_result = await execute_action(investigation, incident, mcp_tools)
-        result["stages"]["action"] = action_result
-        
-        # Validate action output
-        is_valid, error = validate_output(action_result, "action")
-        if not is_valid:
-            logger.warning(f"Action validation failed: {error}")
-            emit_metric("Failure", dimensions={"Schema": "action"})
-            return _human_review_response(sys_id, f"Action validation failed: {error}", result)
-        
-        # ============ STAGE 4: POLICY DECISION ============
-        logger.info("Stage 4: Policy Decision")
-        
-        policy_result = apply_policy(intent_result, investigation, action_result)
-        result["stages"]["policy"] = policy_result
-        
-        # Emit policy metrics
-        emit_metric("Decision", dimensions={"Outcome": policy_result.get("decision", "unknown")})
-        if policy_result.get("override_applied"):
-            emit_metric("Override", dimensions={"Type": policy_result.get("override_type", "unknown")})
-        
-        # ============ STAGE 5: BUILD AND STORE RCA ============
-        logger.info("Stage 5: RCA Storage")
-        
-        rca = build_rca(incident, intent_result, investigation, action_result, policy_result)
-        rca["processing_time_ms"] = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        
+        # Store RCA to S3
         rca_uri = store_rca_to_s3(sys_id, rca)
-        result["rca_uri"] = rca_uri
         
-        # ============ STAGE 6: UPDATE SERVICENOW (if credentials available) ============
-        servicenow_creds = event.get("servicenow_credentials") or context.get("servicenow_credentials")
+        # Update ServiceNow (if credentials available)
+        servicenow_creds = event.get("servicenow_credentials") or (
+            context.get("servicenow_credentials") if context else None
+        )
+        servicenow_update = None
         
         if servicenow_creds and mcp_tools:
-            logger.info("Stage 6: ServiceNow Update")
-            # Find the update_servicenow_ticket tool
+            logger.info("Updating ServiceNow ticket")
             sn_tool = next((t for t in mcp_tools if "servicenow" in t.__name__.lower()), None)
             if sn_tool:
                 try:
-                    sn_update = await sn_tool({
+                    sn_update = sn_tool({
                         "sys_id": sys_id,
-                        "status": _decision_to_status(policy_result.get("decision")),
+                        "status": _decision_to_status(decision),
                         "rca": rca,
-                        "work_notes": f"Automated analysis complete. Decision: {policy_result.get('decision')}"
+                        "work_notes": f"Automated analysis complete. Decision: {decision}",
                     })
-                    result["servicenow_update"] = sn_update
+                    servicenow_update = sn_update
                 except Exception as e:
                     logger.error(f"ServiceNow update failed: {e}")
-                    result["servicenow_update"] = {"success": False, "error": str(e)}
+                    servicenow_update = {"success": False, "error": str(e)}
         
         # ============ BUILD FINAL RESPONSE ============
         processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-        emit_metric("Latency", value=processing_time, dimensions={"Agent": "Orchestrator"}, unit="Milliseconds")
+        emit_metric("Latency", value=processing_time,
+                     dimensions={"Agent": "Orchestrator"}, unit="Milliseconds")
         
         final_response = {
             "incident_id": sys_id,
-            "intent": intent_result.get("intent"),
-            "confidence": intent_result.get("confidence"),
-            "decision": policy_result.get("decision"),
-            "score": policy_result.get("score"),
-            "reasoning": policy_result.get("reasoning"),
+            "intent": intent,
+            "confidence": confidence,
+            "decision": decision,
+            "score": score,
+            "reasoning": reasoning,
             "rca_uri": rca_uri,
-            "actions_taken": [action_result] if action_result.get("action") != "none" else [],
-            "processing_time_ms": processing_time
+            "actions_taken": [],
+            "processing_time_ms": processing_time,
+            "orchestration_mode": "hybrid_agent_as_tool",
         }
+        
+        # Include action if one was taken
+        action_taken = rca.get("remediation", {}).get("action_taken", "none")
+        if action_taken != "none":
+            final_response["actions_taken"] = [{
+                "action": action_taken,
+                "success": rca.get("remediation", {}).get("action_success", False),
+            }]
+        
+        # Include guardrail info if any were triggered
+        if rca.get("guardrails"):
+            final_response["guardrails_triggered"] = rca["guardrails"]
+        
+        if servicenow_update:
+            final_response["servicenow_update"] = servicenow_update
         
         # Validate final output
         is_valid, error = validate_output(final_response, "orchestrator")
@@ -252,7 +234,7 @@ async def handler(event: dict, context: dict) -> dict:
             emit_metric("Failure", dimensions={"Schema": "orchestrator"})
             final_response["validation_warning"] = error
         
-        logger.info(f"Incident {sys_id} processed. Decision: {final_response['decision']}")
+        logger.info(f"Incident {sys_id} processed. Decision: {decision}")
         return final_response
         
     except Exception as e:
@@ -261,14 +243,16 @@ async def handler(event: dict, context: dict) -> dict:
         
         return {
             "incident_id": sys_id,
-            "intent": result.get("stages", {}).get("intent", {}).get("intent", "unknown"),
+            "intent": "unknown",
             "confidence": 0.0,
             "decision": "human_review",
             "score": 0.0,
             "reasoning": f"Processing error: {str(e)}",
             "error": str(e),
-            "partial_results": result
         }
+    finally:
+        # Always clean up the Gateway MCP session
+        gateway.stop()
 
 
 def _human_review_response(sys_id: str, reason: str, partial_results: dict) -> dict:
@@ -298,20 +282,33 @@ def _decision_to_status(decision: str) -> str:
 # Synchronous wrapper for testing
 def handler_sync(event: dict, context: dict = None) -> dict:
     """Synchronous handler for local testing."""
-    import asyncio
-    return asyncio.run(handler(event, context or {}))
+    return handler(event, context or {})
 
 
 if __name__ == "__main__":
-    # Test with sample incident
-    sample_incident = {
-        "incident": {
-            "sys_id": "TEST123",
-            "short_description": "Glue job 'etl-daily-load' failed with OutOfMemory error",
-            "category": "Data Pipeline",
-            "subcategory": "ETL"
-        }
-    }
+    # Test with sample incidents
+    test_incidents = [
+        {
+            "incident": {
+                "sys_id": "TEST123",
+                "short_description": "Glue job 'etl-daily-load' failed with OutOfMemory error",
+                "category": "Data Pipeline",
+                "subcategory": "ETL",
+            }
+        },
+        {
+            "incident": {
+                "sys_id": "TEST456",
+                "short_description": "I need access to production table customer_data in Athena",
+                "category": "Access Request",
+                "subcategory": "Database",
+            }
+        },
+    ]
     
-    result = handler_sync(sample_incident)
-    print(json.dumps(result, indent=2, default=str))
+    for event in test_incidents:
+        print(f"\n{'=' * 80}")
+        print(f"Testing: {event['incident']['short_description']}")
+        print(f"{'=' * 80}")
+        result = handler_sync(event)
+        print(json.dumps(result, indent=2, default=str))

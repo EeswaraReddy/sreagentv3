@@ -11,8 +11,14 @@ from .prompts import INVESTIGATOR_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# Create BedrockModel instance
-bedrock_model = BedrockModel(model_id=MODEL_ID)
+# Lazy-loaded BedrockModel — avoids import failures without AWS creds
+_bedrock_model = None
+
+def _get_bedrock_model():
+    global _bedrock_model
+    if _bedrock_model is None:
+        _bedrock_model = BedrockModel(model_id=MODEL_ID)
+    return _bedrock_model
 
 
 def create_investigator_agent(tools: list = None) -> Agent:
@@ -26,7 +32,7 @@ def create_investigator_agent(tools: list = None) -> Agent:
     """
     return Agent(
         system_prompt=INVESTIGATOR_PROMPT,
-        model=bedrock_model,
+        model=_get_bedrock_model(),
         tools=tools or [],
     )
 

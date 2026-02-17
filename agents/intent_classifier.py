@@ -11,14 +11,26 @@ from .prompts import INTENT_CLASSIFIER_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# Create BedrockModel instance
-bedrock_model = BedrockModel(model_id=MODEL_ID)
+# Lazy-loaded BedrockModel — avoids import failures without AWS creds
+_bedrock_model = None
 
-# Create the intent classifier agent
-intent_classifier_agent = Agent(
-    system_prompt=INTENT_CLASSIFIER_PROMPT,
-    model=bedrock_model,
-)
+def _get_bedrock_model():
+    global _bedrock_model
+    if _bedrock_model is None:
+        _bedrock_model = BedrockModel(model_id=MODEL_ID)
+    return _bedrock_model
+
+# Lazy-created agent — avoids immediate Bedrock connection
+_intent_classifier_agent = None
+
+def _get_classifier_agent():
+    global _intent_classifier_agent
+    if _intent_classifier_agent is None:
+        _intent_classifier_agent = Agent(
+            system_prompt=INTENT_CLASSIFIER_PROMPT,
+            model=_get_bedrock_model(),
+        )
+    return _intent_classifier_agent
 
 
 def classify_intent(incident: dict) -> dict:
@@ -48,8 +60,8 @@ def classify_intent(incident: dict) -> dict:
 Analyze this incident and provide your classification in JSON format."""
 
     try:
-        # Call the agent
-        result = intent_classifier_agent(prompt)
+        # Call the lazy-loaded agent
+        result = _get_classifier_agent()(prompt)
         response_text = str(result)
         
         # Parse and validate response

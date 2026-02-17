@@ -7,6 +7,7 @@ MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-2025
 
 # Gateway configuration
 GATEWAY_ENDPOINT = os.environ.get("GATEWAY_ENDPOINT", "")
+GATEWAY_REGION = os.environ.get("GATEWAY_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 
 # S3 RCA configuration
 RCA_BUCKET = os.environ.get("RCA_BUCKET", "")
@@ -44,6 +45,24 @@ POLICY_THRESHOLDS = {
     "auto_retry": 0.6,    # Medium confidence + action possible
     "escalate": 0.4,      # Low confidence or complex issue
     "human_review": 0.0,  # Fallback for everything else
+}
+
+# Intelligent routing: intents that don't need deep investigation
+SKIP_INVESTIGATION_INTENTS = {
+    "access_denied",      # Access requests → escalate directly
+}
+
+# Fast-track: intents that skip both investigation AND action
+FAST_TRACK_INTENTS = {
+    "access_denied",      # No technical diagnosis needed
+}
+
+# Evaluation gate thresholds — must pass BEFORE updating/closing incidents
+EVALUATION_THRESHOLDS = {
+    "min_confidence_for_auto_action": 0.6,   # Min intent confidence to allow remediation
+    "min_evidence_for_auto_close": 0.7,      # Min evidence score to allow auto-close
+    "min_combined_for_auto_action": 0.5,     # Min combined score to allow any automated action
+    "require_policy_approval": True,          # Policy check mandatory before close
 }
 
 # Intent to tool mapping - helps with semantic search
