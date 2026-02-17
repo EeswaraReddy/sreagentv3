@@ -137,36 +137,48 @@ class GatewayToolProvider:
     # ------------------------------------------------------------------
 
     def _build_auth_headers(self) -> dict:
-        """Build IAM SigV4 auth headers for Gateway requests.
+        """Build IAM SigV4 auth headers for Gateway connection.
 
-        Uses the Lambda execution role in production, or local
-        AWS credentials in dev. Returns an empty dict if signing
-        fails (Gateway may accept unauthenticated requests in dev).
+        Uses the Lambda execution role or local AWS credentials to sign
+        the request to the Gateway endpoint.
         """
         try:
-            import botocore.auth
-            import botocore.credentials
             import botocore.session
-            from urllib.parse import urlparse
+            from botocore.auth import SigV4Auth
+            from botocore.awsrequest import AWSRequest
+
+            if not self.endpoint_url:
+                return {}
 
             session = botocore.session.get_session()
             credentials = session.get_credentials()
+            
             if not credentials:
                 logger.warning("No AWS credentials found for SigV4 signing")
                 return {}
 
+            # Freeze credentials to ensure we have a consistent set (including token)
             frozen = credentials.get_frozen_credentials()
 
-            headers = {
-                "Content-Type": "application/json",
-            }
-
-            # If using temporary credentials (Lambda IAM role), include
-            # the session token
-            if frozen.token:
-                headers["X-Amz-Security-Token"] = frozen.token
-
-            logger.debug("SigV4 auth headers prepared")
+            # Create a request object to sign
+            # We sign the connection endpoint (usually /mcp)
+            service_name = "execute-api"  # API Gateway execution service
+            url = f"{self.endpoint_url.rstrip('/')}/mcp"
+            
+            request = AWSRequest(
+                method="POST",
+                url=url,
+                data=b"", # SSE connection often has empty body or specific handshake
+            )
+            
+            # Apply SigV4 signature
+            SigV4Auth(frozen, service_name, self.region).add_auth(request)
+            
+            # Extract headers (Authorization, X-Amz-Date, X-Amz-Security-Token)
+            headers = dict(request.headers)
+            headers["Content-Type"] = "application/json"
+            
+            logger.debug(f"SigV4 headers generated for {url}")
             return headers
 
         except Exception as e:

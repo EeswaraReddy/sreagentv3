@@ -4,9 +4,7 @@
     "endpoint": {
         "path": "/mcp",
         "authentication": {
-            "type": "cognito_jwt",
-            "userPoolId": "${USER_POOL_ID}",
-            "clientId": "${APP_CLIENT_ID}",
+            "type": "iam",
             "region": "${AWS_REGION}"
         },
         "cors": {

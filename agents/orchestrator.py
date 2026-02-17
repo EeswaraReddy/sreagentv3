@@ -447,10 +447,10 @@ class OrchestratorAgent:
         self.mcp_tools = mcp_tools or []
         _mcp_tools_ref = self.mcp_tools
 
-        # Build tool list — include MCP tools if provided
+        # Build tool list — ONLY the high-level meta-tools
+        # The Orchestrator should NOT see the raw MCP tools (get_emr_logs, etc.)
+        # preventing it from bypassing the sub-agents or hallucinating args.
         tools = list(ORCHESTRATOR_TOOLS)
-        if self.mcp_tools:
-            tools.extend(self.mcp_tools)
 
         # Create the Strands orchestrator agent (lazy-loaded model)
         self.agent = Agent(
@@ -458,8 +458,8 @@ class OrchestratorAgent:
             model=get_bedrock_model(),
             tools=tools,
         )
-        logger.info(f"Orchestrator initialized with {len(tools)} tools "
-                     f"(agent tools + {len(self.mcp_tools)} MCP tools)")
+        logger.info(f"Orchestrator initialized with {len(tools)} meta-tools. "
+                     f"({len(self.mcp_tools)} MCP tools available to sub-agents)")
 
     def orchestrate(self, incident: Dict) -> Dict:
         """Orchestrate the complete incident handling workflow.
